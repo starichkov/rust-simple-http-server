@@ -2,15 +2,16 @@
 
 use super::{
     Response, ServerError, ThreadPool, content_type, handle_connection, parse_request,
-    response_for, shutdown_requested,
+    response_for, run_server, shutdown_requested,
 };
 #[cfg(unix)]
 use super::{SHUTDOWN_REQUESTED, install_shutdown_handler, request_shutdown};
 use std::io::{Cursor, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[test]
 /// Parses all request components, including a body with `Content-Length`.
@@ -36,15 +37,21 @@ fn dispatches_by_method_and_path() {
     let missing = parse_request(&mut Cursor::new(b"POST / HTTP/1.1\r\n\r\n")).unwrap();
 
     assert_eq!(
-        response_for(&get, Path::new("public")).unwrap().status,
+        response_for(&get, Path::new("public"), std::time::Duration::ZERO)
+            .unwrap()
+            .status,
         "200 OK"
     );
     assert_eq!(
-        response_for(&post, Path::new("public")).unwrap().body,
+        response_for(&post, Path::new("public"), std::time::Duration::ZERO)
+            .unwrap()
+            .body,
         b"ok"
     );
     assert_eq!(
-        response_for(&missing, Path::new("public")).unwrap().status,
+        response_for(&missing, Path::new("public"), std::time::Duration::ZERO)
+            .unwrap()
+            .status,
         "404 NOT FOUND"
     );
 }
@@ -53,7 +60,7 @@ fn dispatches_by_method_and_path() {
 /// Includes the status, standard headers, and body in a response.
 fn response_contains_status_headers_and_body() {
     let request = parse_request(&mut Cursor::new(b"GET / HTTP/1.1\r\n\r\n")).unwrap();
-    let response = response_for(&request, Path::new("public")).unwrap();
+    let response = response_for(&request, Path::new("public"), std::time::Duration::ZERO).unwrap();
 
     assert_eq!(response.headers["Content-Length"], "25");
     assert_eq!(response.headers["Content-Type"], "text/html; charset=utf-8");
@@ -256,7 +263,7 @@ fn handles_connection_responses_and_errors() {
             response
         });
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, Path::new("public")).unwrap();
+        handle_connection(stream, Path::new("public"), std::time::Duration::ZERO).unwrap();
         let response = String::from_utf8(client.join().unwrap()).unwrap();
         assert!(response.contains(status), "response was {response}");
     }
@@ -279,4 +286,72 @@ fn serves_static_file_from_directory() {
     let response = super::static_response(&directory, "/static/data.json").unwrap();
     assert_eq!(response.body, b"{}");
     assert_eq!(response.headers["Content-Type"], "application/json");
+}
+
+#[test]
+/// Exercises the nonblocking accept loop and shuts it down through an injected predicate.
+fn runs_server_loop_until_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = Arc::clone(&stopped);
+    let server = thread::spawn(move || {
+        run_server(
+            listener,
+            ThreadPool::new(1),
+            PathBuf::from("public"),
+            Duration::ZERO,
+            move || shutdown.load(std::sync::atomic::Ordering::SeqCst),
+        );
+    });
+
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+
+    stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+/// Reports an I/O error when a client disconnects before its response is written.
+fn reports_connection_write_failure() {
+    let mut observed_failure = false;
+    for _ in 0..10 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        if handle_connection(stream, Path::new("public"), Duration::ZERO).is_err() {
+            observed_failure = true;
+            break;
+        }
+    }
+    assert!(
+        observed_failure,
+        "client disconnect never reached the write path"
+    );
+}
+
+#[test]
+/// Uses an injected delay so the sleeping route can be tested without a five-second wait.
+fn sleeping_route_uses_injected_duration() {
+    let request = parse_request(&mut Cursor::new(b"GET /sleep HTTP/1.1\r\n\r\n")).unwrap();
+    let started = std::time::Instant::now();
+    let response = response_for(&request, Path::new("public"), Duration::ZERO).unwrap();
+
+    assert_eq!(response.status, "200 OK");
+    assert!(started.elapsed() < Duration::from_secs(1));
 }

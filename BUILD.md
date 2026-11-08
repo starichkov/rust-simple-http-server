@@ -50,6 +50,15 @@ cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 ```
 
 GitHub Actions uploads this report to Codecov after the coverage job completes.
+For a readable summary with uncovered source lines, use:
+
+```bash
+cargo llvm-cov --all-features --workspace --show-missing-lines
+```
+
+The in-process server-loop test is included in this report. The integration
+tests additionally verify the real executable, including its command-line
+bind address and concurrent request behavior.
 
 To generate and open local API documentation:
 
@@ -80,6 +89,7 @@ that the fast request is not blocked.
 - `src/main.rs` — request parsing, routing, responses, worker pool, and server entry point.
 - `public/` — static files served by `GET /static/<file>`.
 - `tests/concurrency.rs` — integration coverage for concurrent connections.
+- `tests/startup.rs` — integration coverage for command-line startup and binding.
 - `.github/workflows/rust.yml` — formatting, compilation, tests, Clippy, and documentation checks.
 
 ## Run the server locally

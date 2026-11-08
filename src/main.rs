@@ -215,16 +215,36 @@ fn main() {
         .set_nonblocking(true)
         .expect("could not make listener nonblocking");
     install_shutdown_handler();
-    let pool = ThreadPool::new(4);
-    let static_dir = PathBuf::from("public");
+    run_server(
+        listener,
+        ThreadPool::new(4),
+        PathBuf::from("public"),
+        Duration::from_secs(5),
+        shutdown_requested,
+    );
+}
 
-    eprintln!("listening on {address}; press Ctrl-C to stop");
-    while !shutdown_requested() {
+/// Runs the nonblocking accept loop until the supplied shutdown predicate is true.
+///
+/// Keeping the listener, pool, static-file directory, and shutdown decision as
+/// parameters makes the server loop testable without launching another process.
+fn run_server(
+    listener: TcpListener,
+    pool: ThreadPool,
+    static_dir: PathBuf,
+    sleep_duration: Duration,
+    should_shutdown: impl Fn() -> bool,
+) {
+    eprintln!(
+        "listening on {}; press Ctrl-C to stop",
+        listener.local_addr().expect("listener address unavailable")
+    );
+    while !should_shutdown() {
         match listener.accept() {
             Ok((stream, _)) => {
                 let static_dir = static_dir.clone();
                 if let Err(error) = pool.execute(move || {
-                    if let Err(error) = handle_connection(stream, &static_dir) {
+                    if let Err(error) = handle_connection(stream, &static_dir, sleep_duration) {
                         eprintln!("connection error: {error}");
                     }
                 }) {
@@ -266,7 +286,11 @@ fn shutdown_requested() -> bool {
 }
 
 /// Parses and serves one client connection while logging method, path, status, and duration.
-fn handle_connection(mut stream: TcpStream, static_dir: &Path) -> Result<(), ServerError> {
+fn handle_connection(
+    mut stream: TcpStream,
+    static_dir: &Path,
+    sleep_duration: Duration,
+) -> Result<(), ServerError> {
     let started = Instant::now();
     let mut reader = BufReader::new(&stream);
     let parsed = parse_request(&mut reader);
@@ -275,7 +299,7 @@ fn handle_connection(mut stream: TcpStream, static_dir: &Path) -> Result<(), Ser
         if request.version != "HTTP/1.1" {
             return Err(ServerError::UnsupportedVersion(request.version));
         }
-        let response = response_for(&request, static_dir)?;
+        let response = response_for(&request, static_dir, sleep_duration)?;
         response.write_to(&mut stream)?;
         Ok((request.method, request.path, response.status))
     });
@@ -357,11 +381,15 @@ fn invalid_request(message: &str) -> ServerError {
 }
 
 /// Selects a response by matching the request method and path as a tuple.
-fn response_for(request: &Request, static_dir: &Path) -> Result<Response, ServerError> {
+fn response_for(
+    request: &Request,
+    static_dir: &Path,
+    sleep_duration: Duration,
+) -> Result<Response, ServerError> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => Ok(Response::new("200 OK", "<h1>Hello from Rust!</h1>")),
         ("GET", "/sleep") => {
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(sleep_duration);
             Ok(Response::new("200 OK", "<h1>Finished sleeping.</h1>"))
         }
         ("POST", "/echo") => Ok(Response::new("200 OK", request.body.clone())),
