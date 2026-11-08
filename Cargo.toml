@@ -1,0 +1,15 @@
+[package]
+name = "rust-simple-http-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Vadim Starichkov"]
+description = "An educational HTTP/1.1 server built with Rust's standard library"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/starichkov/rust-simple-http-server"
+homepage = "https://github.com/starichkov/rust-simple-http-server"
+keywords = ["http", "server", "tcp", "networking", "education"]
+categories = ["web-programming::http-server"]
+
+[dependencies]
