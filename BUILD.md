@@ -58,7 +58,9 @@ cargo llvm-cov --all-features --workspace --show-missing-lines
 
 The in-process server-loop test is included in this report. The integration
 tests additionally verify the real executable, including its command-line
-bind address and concurrent request behavior.
+bind address and concurrent request behavior. `cargo llvm-cov` propagates
+`LLVM_PROFILE_FILE` to those child processes, so the startup executable paths
+are collected alongside the test process when coverage is generated in CI.
 
 To generate and open local API documentation:
 

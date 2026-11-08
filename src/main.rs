@@ -30,6 +30,8 @@ enum ServerError {
     UnsupportedVersion(String),
     /// A requested static file does not exist or is unsafe to access.
     NotFound(String),
+    /// The server could not be configured from its command-line arguments.
+    Startup(String),
 }
 
 impl fmt::Display for ServerError {
@@ -41,6 +43,7 @@ impl fmt::Display for ServerError {
                 write!(formatter, "unsupported version: {version}")
             }
             Self::NotFound(path) => write!(formatter, "file not found: {path}"),
+            Self::Startup(message) => write!(formatter, "startup error: {message}"),
         }
     }
 }
@@ -59,7 +62,7 @@ impl ServerError {
         match self {
             Self::InvalidRequest(_) | Self::UnsupportedVersion(_) => "400 BAD REQUEST",
             Self::NotFound(_) => "404 NOT FOUND",
-            Self::Io(_) => "500 INTERNAL SERVER ERROR",
+            Self::Io(_) | Self::Startup(_) => "500 INTERNAL SERVER ERROR",
         }
     }
 }
@@ -71,6 +74,24 @@ struct ThreadPool {
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// The part of a listener needed by the accept loop.
+trait Listener {
+    /// Returns the address on which the listener is accepting connections.
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr>;
+    /// Accepts the next connection or reports why it could not be accepted.
+    fn accept(&self) -> std::io::Result<(TcpStream, std::net::SocketAddr)>;
+}
+
+impl Listener for TcpListener {
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        TcpListener::local_addr(self)
+    }
+
+    fn accept(&self) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
+        TcpListener::accept(self)
+    }
+}
 
 enum Message {
     NewJob(Job),
@@ -207,13 +228,15 @@ impl Response {
 
 /// Starts the server and dispatches accepted connections to a fixed worker pool.
 fn main() {
-    let address = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
-    let listener = TcpListener::bind(&address).expect("could not bind to server address");
-    listener
-        .set_nonblocking(true)
-        .expect("could not make listener nonblocking");
+    if let Err(error) = start_server(std::env::args().nth(1).as_deref()) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+/// Binds and starts the server using an optional command-line address.
+fn start_server(address: Option<&str>) -> Result<(), ServerError> {
+    let listener = bind_listener(address)?;
     install_shutdown_handler();
     run_server(
         listener,
@@ -221,42 +244,59 @@ fn main() {
         PathBuf::from("public"),
         Duration::from_secs(5),
         shutdown_requested,
-    );
+    )
+}
+
+/// Selects the configured address, retaining the documented default.
+fn configured_address(address: Option<&str>) -> &str {
+    address.unwrap_or("127.0.0.1:7878")
+}
+
+/// Binds and configures a nonblocking listener for server startup.
+fn bind_listener(address: Option<&str>) -> Result<TcpListener, ServerError> {
+    let address = configured_address(address);
+    let listener = TcpListener::bind(address)
+        .map_err(|error| ServerError::Startup(format!("could not bind to {address}: {error}")))?;
+    listener.set_nonblocking(true).map_err(|error| {
+        ServerError::Startup(format!("could not make listener nonblocking: {error}"))
+    })?;
+    Ok(listener)
 }
 
 /// Runs the nonblocking accept loop until the supplied shutdown predicate is true.
 ///
 /// Keeping the listener, pool, static-file directory, and shutdown decision as
 /// parameters makes the server loop testable without launching another process.
-fn run_server(
-    listener: TcpListener,
+fn run_server<L: Listener>(
+    listener: L,
     pool: ThreadPool,
     static_dir: PathBuf,
     sleep_duration: Duration,
     should_shutdown: impl Fn() -> bool,
-) {
-    eprintln!(
-        "listening on {}; press Ctrl-C to stop",
-        listener.local_addr().expect("listener address unavailable")
-    );
+) -> Result<(), ServerError> {
+    let address = listener
+        .local_addr()
+        .map_err(|error| ServerError::Startup(format!("listener address unavailable: {error}")))?;
+    eprintln!("listening on {address}; press Ctrl-C to stop");
     while !should_shutdown() {
         match listener.accept() {
             Ok((stream, _)) => {
                 let static_dir = static_dir.clone();
                 if let Err(error) = pool.execute(move || {
                     if let Err(error) = handle_connection(stream, &static_dir, sleep_duration) {
-                        eprintln!("connection error: {error}");
+                        log_connection_error(&error);
                     }
                 }) {
-                    eprintln!("failed to queue connection: {error}");
+                    log_queue_error(&error);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => eprintln!("failed to accept connection: {error}"),
+            Err(error) => log_accept_error(&error),
         }
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -305,19 +345,40 @@ fn handle_connection(
     });
     match result {
         Ok((method, path, status)) => {
-            eprintln!("{method} {path} -> {status} ({:?})", started.elapsed());
+            eprintln!("{}", request_log(&method, &path, status, started.elapsed()));
             Ok(())
         }
         Err(error) => {
-            eprintln!(
-                "request failed -> {} ({:?}): {error}",
-                error.status(),
-                started.elapsed()
-            );
+            eprintln!("{}", connection_error_log(&error, started.elapsed()));
             let response = Response::new(error.status(), format!("<h1>{error}</h1>"));
             response.write_to(&mut stream).map_err(ServerError::from)
         }
     }
+}
+
+/// Formats a successful request log entry.
+fn request_log(method: &str, path: &str, status: &str, duration: Duration) -> String {
+    format!("{method} {path} -> {status} ({duration:?})")
+}
+
+/// Formats and emits a connection-handling error.
+fn connection_error_log(error: &ServerError, duration: Duration) -> String {
+    format!(
+        "request failed -> {} ({duration:?}): {error}",
+        error.status()
+    )
+}
+
+fn log_connection_error(error: &ServerError) {
+    eprintln!("connection error: {error}");
+}
+
+fn log_queue_error(error: &ServerError) {
+    eprintln!("failed to queue connection: {error}");
+}
+
+fn log_accept_error(error: &std::io::Error) {
+    eprintln!("failed to accept connection: {error}");
 }
 
 /// Reads an HTTP request line, headers, and body from a buffered stream.

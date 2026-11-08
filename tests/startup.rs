@@ -56,3 +56,16 @@ fn starts_on_command_line_bind_address() {
     assert!(response.contains("HTTP/1.1 200 OK"));
     assert!(response.contains("Hello from Rust!"));
 }
+
+#[test]
+/// Confirms invalid startup configuration is reported on stderr and exits nonzero.
+fn rejects_invalid_command_line_bind_address() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rust-simple-http-server"))
+        .arg("not-an-address")
+        .output()
+        .expect("failed to launch server with invalid address");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("startup error: could not bind to not-an-address"));
+}

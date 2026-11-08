@@ -1,13 +1,14 @@
 //! Unit tests for request parsing, routing, and response construction.
 
 use super::{
-    Response, ServerError, ThreadPool, content_type, handle_connection, parse_request,
-    response_for, run_server, shutdown_requested,
+    Listener, Response, ServerError, ThreadPool, configured_address, connection_error_log,
+    content_type, handle_connection, parse_request, request_log, response_for, run_server,
+    shutdown_requested, start_server,
 };
 #[cfg(unix)]
 use super::{SHUTDOWN_REQUESTED, install_shutdown_handler, request_shutdown};
 use std::io::{Cursor, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -109,6 +110,11 @@ fn formats_errors_and_maps_statuses() {
             "file not found: /missing",
             "404 NOT FOUND",
         ),
+        (
+            ServerError::Startup("bad address".into()),
+            "startup error: bad address",
+            "500 INTERNAL SERVER ERROR",
+        ),
     ];
 
     for (error, display, status) in errors {
@@ -118,6 +124,19 @@ fn formats_errors_and_maps_statuses() {
 
     let io_error: ServerError = std::io::Error::other("converted").into();
     assert_eq!(io_error.to_string(), "I/O error: converted");
+}
+
+#[test]
+/// Keeps request and failure diagnostics independently testable and readable.
+fn formats_diagnostic_log_entries() {
+    assert_eq!(
+        request_log("GET", "/", "200 OK", Duration::ZERO),
+        "GET / -> 200 OK (0ns)"
+    );
+    assert_eq!(
+        connection_error_log(&ServerError::InvalidRequest("bad".into()), Duration::ZERO),
+        "request failed -> 400 BAD REQUEST (0ns): invalid request: bad"
+    );
 }
 
 #[test]
@@ -185,6 +204,31 @@ fn thread_pool_rejects_jobs_after_sender_is_taken() {
         error.to_string(),
         "invalid request: thread pool is shut down"
     );
+}
+
+#[test]
+/// Exercises the accept-loop branch used when the worker channel is closed.
+fn server_reports_rejected_connection_jobs() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let client = thread::spawn(move || {
+        let _stream = TcpStream::connect(address).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+    let mut pool = ThreadPool::new(1);
+    pool.sender.take();
+    run_server(
+        listener,
+        pool,
+        PathBuf::from("public"),
+        Duration::ZERO,
+        move || observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 1,
+    )
+    .unwrap();
+    client.join().unwrap();
 }
 
 #[cfg(unix)]
@@ -303,7 +347,8 @@ fn runs_server_loop_until_shutdown() {
             PathBuf::from("public"),
             Duration::ZERO,
             move || shutdown.load(std::sync::atomic::Ordering::SeqCst),
-        );
+        )
+        .unwrap();
     });
 
     let mut stream = TcpStream::connect(address).unwrap();
@@ -316,6 +361,87 @@ fn runs_server_loop_until_shutdown() {
 
     stopped.store(true, std::sync::atomic::Ordering::SeqCst);
     server.join().unwrap();
+}
+
+#[test]
+/// Returns a typed startup error instead of panicking on an invalid address.
+fn startup_rejects_invalid_address() {
+    let error = start_server(Some("not-an-address")).unwrap_err();
+    assert_eq!(error.status(), "500 INTERNAL SERVER ERROR");
+    assert!(
+        error
+            .to_string()
+            .contains("could not bind to not-an-address")
+    );
+}
+
+#[test]
+/// Keeps the documented default while allowing callers to select another address.
+fn selects_default_and_custom_addresses() {
+    assert_eq!(configured_address(None), "127.0.0.1:7878");
+    assert_eq!(configured_address(Some("127.0.0.1:0")), "127.0.0.1:0");
+}
+
+struct FailingListener {
+    address: SocketAddr,
+}
+
+impl Listener for FailingListener {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Ok(self.address)
+    }
+
+    fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        Err(std::io::Error::other("synthetic accept failure"))
+    }
+}
+
+struct AddresslessListener;
+
+impl Listener for AddresslessListener {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Err(std::io::Error::other("synthetic address failure"))
+    }
+
+    fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        unreachable!("accept is not reached when local_addr fails")
+    }
+}
+
+#[test]
+/// Reports an address lookup failure through the typed startup error.
+fn server_rejects_unavailable_listener_address() {
+    let error = run_server(
+        AddresslessListener,
+        ThreadPool::new(1),
+        PathBuf::from("public"),
+        Duration::ZERO,
+        || false,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.status(), "500 INTERNAL SERVER ERROR");
+    assert_eq!(
+        error.to_string(),
+        "startup error: listener address unavailable: synthetic address failure"
+    );
+}
+
+#[test]
+/// Exercises unexpected listener errors deterministically without OS-specific tricks.
+fn server_logs_unexpected_listener_errors() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    run_server(
+        FailingListener {
+            address: "127.0.0.1:7878".parse().unwrap(),
+        },
+        ThreadPool::new(1),
+        PathBuf::from("public"),
+        Duration::ZERO,
+        move || observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 1,
+    )
+    .unwrap();
 }
 
 #[test]
